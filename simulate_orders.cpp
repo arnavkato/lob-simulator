@@ -8,11 +8,6 @@
 #include "imgui_impl_opengl3.h"
 #include <GLFW/glfw3.h>
 
-struct Candle
-{
-    int64_t open{}, high{}, low{}, close{};
-};
-
 class Simulator
 {
     OrderBook book;
@@ -24,17 +19,11 @@ class Simulator
     std::bernoulli_distribution limit_dist{0.8};               // 80% of orders are limit orders
     std::bernoulli_distribution action_dist{0.7};
     uint64_t next_id{0};                                      // for keeping track of order ids
-    std::exponential_distribution<double> interval_dist{5.0}; // avg 5 actions/sec (mean gap = 1/5 s)
+    std::exponential_distribution<double> interval_dist{25.0}; // avg 25 actions/sec (mean gap = 1/25 s)
     double time_until_next{0.0};
 
     int64_t fair_value{10000};                             // drifting fundamental the market tracks
     std::normal_distribution<double> drift_dist{0.0, 4.0}; // random-walk step per action (ticks)
-
-    std::deque<Candle> candles;               // finished OHLC candles
-    Candle current{};                         // candle currently being built
-    bool candle_started{false};
-    double candle_time{0.0};
-    static constexpr double CANDLE_SECS{1.0}; // wall-clock seconds per candle
 
 public:
     std::vector<std::pair<int64_t, uint32_t>> bids(int n) const { return book.get_bids(n); }
@@ -42,43 +31,6 @@ public:
     std::optional<int64_t> best_bid() const { return book.get_best_bid(); }
     std::optional<int64_t> best_ask() const { return book.get_best_ask(); }
     std::vector<Trade> trades(int n) const { return book.get_trades(n); }
-
-    std::vector<Candle> candle_history() const
-    {
-        std::vector<Candle> v(candles.begin(), candles.end());
-        if (candle_started)
-            v.push_back(current); // include the in-progress candle
-        return v;
-    }
-
-    // sample the current mid into OHLC candles; call once per frame with elapsed time
-    void sample(double dt)
-    {
-        auto b = book.get_best_bid();
-        auto a = book.get_best_ask();
-        if (!b || !a)
-            return; // need a two-sided market to have a mid
-        int64_t mid = (*b + *a) / 2;
-
-        if (!candle_started)
-        {
-            current = {mid, mid, mid, mid};
-            candle_started = true;
-        }
-        current.high = std::max(current.high, mid);
-        current.low = std::min(current.low, mid);
-        current.close = mid;
-
-        candle_time += dt;
-        if (candle_time >= CANDLE_SECS)
-        {
-            candles.push_back(current);
-            if (candles.size() > 120)
-                candles.pop_front();
-            candle_time = 0.0;
-            current = {mid, mid, mid, mid};
-        }
-    }
 
     void advance(double dt)
     {
@@ -200,7 +152,6 @@ int main()
 
         float dt = ImGui::GetIO().DeltaTime;
         sim.advance(dt); // advance the sim in real time
-        sim.sample(dt);  // record the mid into candles
 
         // ---- DOM-style depth ladder (fills the whole window) ----
         const ImGuiViewport *vp = ImGui::GetMainViewport();
@@ -221,47 +172,68 @@ int main()
             ImGui::TextDisabled("(book empty)");
         ImGui::Spacing();
 
-        // ---- candle chart (mid price over time) ----
+        // ---- market depth chart (cumulative order book depth) ----
         {
-            auto candles = sim.candle_history();
+            auto dbids = sim.bids(40); // best-first: descending price
+            auto dasks = sim.asks(40); // best-first: ascending price
             ImGui::BeginChild("chart", ImVec2(0, 340), true);
-            if (candles.size() >= 2)
+            if (!dbids.empty() && !dasks.empty())
             {
-                int64_t lo = INT64_MAX, hi = INT64_MIN;
-                for (auto &c : candles)
+                // cumulative depth outward from the spread
+                std::vector<std::pair<int64_t, double>> bc, ac;
+                double run = 0;
+                for (auto &b : dbids)
                 {
-                    lo = std::min(lo, c.low);
-                    hi = std::max(hi, c.high);
+                    run += b.second;
+                    bc.push_back({b.first, run});
                 }
-                if (hi <= lo)
-                    hi = lo + 1;
+                run = 0;
+                for (auto &a : dasks)
+                {
+                    run += a.second;
+                    ac.push_back({a.first, run});
+                }
+
+                int64_t pmin = bc.back().first; // deepest (lowest) bid price
+                int64_t pmax = ac.back().first; // deepest (highest) ask price
+                double cmax = std::max(bc.back().second, ac.back().second);
+                if (pmax <= pmin)
+                    pmax = pmin + 1;
+                if (cmax <= 0.0)
+                    cmax = 1.0;
 
                 ImVec2 org = ImGui::GetCursorScreenPos();
                 ImVec2 area = ImGui::GetContentRegionAvail();
                 ImDrawList *dl = ImGui::GetWindowDrawList();
+                float base = org.y + area.y;
+                auto X = [&](int64_t p) // price -> screen x
+                { return org.x + area.x * (float)(p - pmin) / (float)(pmax - pmin); };
+                auto Y = [&](double c) // cumulative volume -> screen y
+                { return org.y + area.y * (float)(1.0 - c / cmax); };
 
-                float slot = area.x / candles.size(); // horizontal space per candle
-                auto y_of = [&](int64_t p)            // price -> screen y (higher price = higher up)
-                { return org.y + area.y * (1.0f - (float)(p - lo) / (float)(hi - lo)); };
+                const ImU32 gfill = IM_COL32(90, 200, 110, 80), gline = IM_COL32(90, 210, 120, 255);
+                const ImU32 rfill = IM_COL32(230, 90, 90, 80), rline = IM_COL32(230, 100, 100, 255);
 
-                for (size_t i = 0; i < candles.size(); ++i)
+                // bids: staircase over [p(i+1), p(i)] at cumulative height c(i), rising to the left
+                for (size_t i = 0; i + 1 < bc.size(); ++i)
                 {
-                    const Candle &c = candles[i];
-                    float x = org.x + (i + 0.5f) * slot;
-                    ImU32 col = (c.close >= c.open) ? IM_COL32(90, 210, 120, 255)
-                                                    : IM_COL32(230, 100, 100, 255);
-                    dl->AddLine(ImVec2(x, y_of(c.high)), ImVec2(x, y_of(c.low)), col, 1.5f); // wick
-                    float yo = y_of(c.open), yc = y_of(c.close);
-                    float bw = slot * 0.6f;
-                    if (bw < 1.0f)
-                        bw = 1.0f;
-                    dl->AddRectFilled(ImVec2(x - bw / 2, std::min(yo, yc)),
-                                      ImVec2(x + bw / 2, std::max(yo, yc) + 1.0f), col); // body
+                    float xL = X(bc[i + 1].first), xR = X(bc[i].first), y = Y(bc[i].second);
+                    dl->AddRectFilled(ImVec2(xL, y), ImVec2(xR, base), gfill);
+                    dl->AddLine(ImVec2(xL, y), ImVec2(xR, y), gline, 2.0f);
+                    dl->AddLine(ImVec2(xL, y), ImVec2(xL, Y(bc[i + 1].second)), gline, 2.0f);
+                }
+                // asks: staircase over [q(i), q(i+1)] at cumulative height d(i), rising to the right
+                for (size_t i = 0; i + 1 < ac.size(); ++i)
+                {
+                    float xL = X(ac[i].first), xR = X(ac[i + 1].first), y = Y(ac[i].second);
+                    dl->AddRectFilled(ImVec2(xL, y), ImVec2(xR, base), rfill);
+                    dl->AddLine(ImVec2(xL, y), ImVec2(xR, y), rline, 2.0f);
+                    dl->AddLine(ImVec2(xR, y), ImVec2(xR, Y(ac[i + 1].second)), rline, 2.0f);
                 }
             }
             else
             {
-                ImGui::TextDisabled("building candles...");
+                ImGui::TextDisabled("waiting for a two-sided book...");
             }
             ImGui::EndChild();
         }
