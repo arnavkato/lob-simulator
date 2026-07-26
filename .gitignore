@@ -1,0 +1,10 @@
+# local AI-assistant config, not part of the project
+CLAUDE.md
+
+# vendored dependency — clone separately (see README)
+imgui/
+
+# build artifacts
+*.o
+sim
+imgui.ini
