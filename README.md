@@ -2,8 +2,10 @@
 
 A from-scratch limit order book and matching engine in C++, with a live
 [Dear ImGui](https://github.com/ocornut/imgui) visualization: a depth-of-market
-ladder, a time & sales tape, and a candlestick chart, all driven by a
+ladder, a time & sales tape, and a market depth chart, all driven by a
 randomized order-flow simulator.
+
+![depth-of-market view](demo.gif)
 
 ## Build
 
